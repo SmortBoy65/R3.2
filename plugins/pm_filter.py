@@ -156,7 +156,7 @@ async def next_page(bot, query):
 
     btn = []
     for file in files:
-        file_id = file.get("file_id")
+        file_id = file.get("_id") or file.get("file_id")
         title = file.get("file_name", "Unknown Title")
         size = get_size(file.get("file_size", 0))
 
@@ -343,7 +343,7 @@ async def auto_filter(client, msg, message, reply_msg, ai_search, spoll=None):
 
     btn = []
     for file in files:
-        file_id = file.get("file_id")
+        file_id = file.get("_id") or file.get("file_id")
         title = file.get("file_name", "Unknown Title")
         size = get_size(file.get("file_size", 0))
 

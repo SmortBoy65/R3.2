@@ -54,7 +54,6 @@ async def restart_bot(client, message):
     os.execl(sys.executable, sys.executable, "-m", "bot")
 
 @Client.on_message(filters.command("verification") & filters.user(ADMINS))
-@admin_only
 async def verification_toggle(client, message):
     try:
         _, status = message.text.split()
@@ -67,7 +66,7 @@ async def verification_toggle(client, message):
         else:
             await message.reply_text("Invalid status. Use `/verification on` or `/verification off`.")
     except ValueError:
-        await message.reply_text("Usage: `/verification <on|off>`")
+        await message.reply_text("Usage: /verification <on|off>")
 
 @Client.on_message(filters.command("verifyshortener") & filters.user(ADMINS))
 @admin_only
