@@ -436,11 +436,11 @@ async def start(client, message):
             return await message.reply('<b><i>No such file exist.</b></i>')
         filesarr = []
         for file in files:
-            file_id = file["file_id"]
-            files1 = await get_file_details(file_id)
-            title = files1["file_name"]
-            size=get_size(files1["file_size"])
-            f_caption=files1["caption"]
+            file_id = file.get("_id") or file.get("file_id")
+            # The get_file_details call was redundant. The 'file' object already contains all details.
+            title = file["file_name"]
+            size=get_size(file["file_size"])
+            f_caption=file["caption"]
             parsed_data = parse_info(title, f_caption)
             f_caption = format_caption(parsed_data)
             if not await db.has_premium_access(message.from_user.id):
