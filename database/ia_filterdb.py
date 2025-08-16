@@ -341,10 +341,18 @@ async def get_bad_files(query, file_type=None, use_filter=False):
 
 
 async def get_file_details(query):
+    logger.info(f"Searching for file with query: {query}")
     file = col.find_one({'_id': query}) or sec_col.find_one({'_id': query})
     if file:
+        logger.info(f"Found file with _id: {query}")
         return file
-    return col.find_one({'file_id': query}) or sec_col.find_one({'file_id': query})
+    logger.info(f"Did not find file with _id: {query}, trying file_id")
+    file = col.find_one({'file_id': query}) or sec_col.find_one({'file_id': query})
+    if file:
+        logger.info(f"Found file with file_id: {query}")
+    else:
+        logger.info(f"Did not find file with file_id: {query}")
+    return file
 
 def encode_file_id(s: bytes) -> str:
     r = b""
