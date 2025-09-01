@@ -2,7 +2,7 @@
 # Subscribe YouTube Channel For Amazing Bot @Tech_VJ
 # Ask Doubt on telegram @KingVJ01
 
-import os, logging, string, asyncio, time, re, ast, random, math, pytz, pyrogram, base64
+import os, logging, string, asyncio, time, re, ast, random, math, pytz, pyrogram, base64, json
 from datetime import datetime, timedelta, date, time
 from Script import script
 from info import *
@@ -22,6 +22,13 @@ from TechVJ.util.file_properties import get_name, get_hash, get_media_file_size
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 lock = asyncio.Lock()
+
+async def schedule_message_deletion(message, time_in_seconds):
+    await asyncio.sleep(time_in_seconds)
+    try:
+        await message.delete()
+    except Exception as e:
+        logger.info(f"Couldn't delete message after timeout: {e}")
 
 BUTTON = {}
 BUTTONS = {}
@@ -43,38 +50,6 @@ def parse_s_e_from_name(name):
         return int(match.group(2)), None
     return None, None
 
-def calculate_match_score(file_name, query):
-    """
-    Calculates a score based on how closely the file name matches the query.
-    Lower scores are better.
-    """
-    # Define stop words to ignore in the file name
-    stop_words = [
-        '1080p', '720p', '480p', 'bluray', 'x264', 'x265', 'webrip', 'hdrip',
-        'hdcam', 'dvdrip', 'dual', 'audio', 'multi'
-    ]
-    # Add all language tokens from the LANGUAGES dict to stop words
-    for lang_tokens in LANGUAGES.values():
-        stop_words.extend(lang_tokens)
-
-    # Clean the file name
-    # Remove S/E and year patterns
-    name = re.sub(r'\b(s|season)\s?\d{1,2}[\s\._-]*(e|ep|episode)\s?\d{1,3}\b', '', file_name, flags=re.IGNORECASE)
-    name = re.sub(r'\b(19|20)\d{2}\b', '', name)
-    # Remove any characters that are not letters, numbers, or spaces
-    name = re.sub(r'[^\w\s]', '', name)
-
-    # Tokenize and filter out stop words
-    name_words = [word for word in name.lower().split() if word not in stop_words and not word.isdigit()]
-
-    # Clean and tokenize the query
-    query_words = query.lower().split()
-
-    # Calculate the score as the number of extra words in the file name
-    score = len(name_words) - len(query_words)
-
-    # We only want to penalize extra words, so the score cannot be negative
-    return max(0, score)
 
 
 @Client.on_message(filters.group & filters.text & filters.incoming)
@@ -100,8 +75,8 @@ async def give_filter(client, message):
             try:
                 if settings.get('auto_ffilter'):
                     ai_search = True
-                    reply_msg = await message.reply_text(f"<b><i>Searching For {message.text} 🔍</i></b>")
-                    await auto_filter(client, message.text, message, reply_msg, ai_search)
+                    reply_msg = await message.reply_photo(photo=LOADING_GIF, caption=f"<b><i>Searching For {message.text} 🔍</i></b>")
+                    await auto_filter(client, message.text, message, reply_msg, ai_search, user_id)
             except Exception as e:
                 logger.exception(f"[GIVE_FILTER] An unexpected error occurred: {e}")
     else: #a better logic to avoid repeated lines of code in auto_filter function
@@ -123,8 +98,8 @@ async def pm_text(bot, message):
     if content.startswith("/") or content.startswith("#"): return  # ignore commands and hashtags
     if PM_SEARCH == True:
         ai_search = True
-        reply_msg = await bot.send_message(message.from_user.id, f"<b><i>Searching For {content} 🔍</i></b>", reply_to_message_id=message.id)
-        await auto_filter(bot, content, message, reply_msg, ai_search)
+        reply_msg = await bot.send_photo(message.from_user.id, photo=LOADING_GIF, caption=f"<b><i>Searching For {content} 🔍</i></b>", reply_to_message_id=message.id)
+        await auto_filter(bot, content, message, reply_msg, ai_search, user_id)
 
 @Client.on_callback_query(filters.regex(r"^next"))
 async def next_page(bot, query):
@@ -134,30 +109,29 @@ async def next_page(bot, query):
     except:
         offset = 0
 
-    search = temp.ACTIVE_SEARCHES.get(key)
-    if not search:
+    search_data = temp.ACTIVE_SEARCHES.get(key)
+    if not search_data:
         return await query.answer("⚠️ This button has expired.", show_alert=True)
+
+    try:
+        if query.from_user.id != search_data['user_id']:
+            return await query.answer(script.ALRT_TXT.format(query.from_user.first_name), show_alert=True)
+        search = search_data['query']
+    except (TypeError, KeyError):
+        search = search_data
 
     files, n_offset, total, _ = await get_search_results(query.message.chat.id, search, offset=offset, filter=True)
     if not files:
         return await query.answer("No more files found on this page.", show_alert=True)
 
-    # Score and sort the files
-    scored_files = []
-    for file in files:
-        file_name = file.get("file_name", "")
-        score = calculate_match_score(file_name, search) # Use `search` which is the clean query from ACTIVE_SEARCHES
-        scored_files.append({'file': file, 'score': score})
-
-    scored_files.sort(key=lambda x: x['score'])
-    files = [item['file'] for item in scored_files]
 
     temp.GETALL[key] = files
 
-    btn = []
+    btn = [[InlineKeyboardButton("🔎 Filter Results", callback_data=f"filter_results#{key}")]]
     for file in files:
         file_id = file.get("file_id")
         title = file.get("file_name", "Unknown Title")
+        title = re.sub(r'@\S+', '', title).strip()
         size = get_size(file.get("file_size", 0))
 
         season, episode = parse_s_e_from_name(title)
@@ -172,28 +146,41 @@ async def next_page(bot, query):
             button_text += f" [{s_e_info}]"
         button_text += f" {title}"
 
-        btn.append([InlineKeyboardButton(text=button_text, callback_data=f"file#{file_id}")])
+        btn.append([InlineKeyboardButton(text=button_text, callback_data=f"file#{key}#{file_id}")])
+
+    nav_btns = []
+    if offset > 0:
+        nav_btns.append(InlineKeyboardButton("⌫ ʙᴀᴄᴋ", callback_data=f"next_0_{key}_{int(offset)-10}"))
+
+    if total > 10:
+        nav_btns.append(InlineKeyboardButton(f"{math.ceil(int(offset)/10)+1} / {math.ceil(total/10)}", callback_data="pages"))
 
     if n_offset:
-        btn.append([
-            InlineKeyboardButton("⌫ ʙᴀᴄᴋ", callback_data=f"next_0_{key}_{int(offset)-10}" if offset else f"next_0_{key}_0"),
-            InlineKeyboardButton(f"{math.ceil(int(offset)/10)+1} / {math.ceil(total/10)}", callback_data="pages"),
-            InlineKeyboardButton("ɴᴇxᴛ ➪", callback_data=f"next_0_{key}_{n_offset}")
-        ])
+        nav_btns.append(InlineKeyboardButton("ɴᴇxᴛ ➪", callback_data=f"next_0_{key}_{n_offset}"))
 
-    btn.append([InlineKeyboardButton("🔎 Filter Results", callback_data=f"filter_results#{key}")])
+    if nav_btns:
+        btn.append(nav_btns)
 
     try:
-        await query.message.edit_text(
-            text=f"<b>Here are the results for your query.\nThis message will self-destruct in 10 minutes for privacy.</b>",
+        await query.message.edit_caption(
+            caption=f"<b>Here are the results for your query.\nThis message will self-destruct in 10 minutes for privacy.</b>",
             reply_markup=InlineKeyboardMarkup(btn)
         )
+        asyncio.create_task(schedule_message_deletion(query.message, 600))
     except MessageNotModified:
         pass
 
 @Client.on_callback_query(filters.regex(r"^filter_results#"))
 async def filter_results_cb_handler(client: Client, query: CallbackQuery):
     _, key = query.data.split("#")
+    search_data = temp.ACTIVE_SEARCHES.get(key)
+    if not search_data:
+        return await query.answer("⚠️ This button has expired.", show_alert=True)
+    try:
+        if query.from_user.id != search_data['user_id']:
+            return await query.answer(script.ALRT_TXT.format(query.from_user.first_name), show_alert=True)
+    except (TypeError, KeyError):
+        pass
     btn = [
         [InlineKeyboardButton("🎬 Movies", callback_data=f"movies#{key}")],
         [InlineKeyboardButton("📺 Series", callback_data=f"series#{key}")],
@@ -210,6 +197,15 @@ async def movies_cb_handler(client: Client, query: CallbackQuery):
     except:
         _, key = query.data.split("#")
         page = 1
+
+    search_data = temp.ACTIVE_SEARCHES.get(key)
+    if not search_data:
+        return await query.answer("⚠️ This button has expired.", show_alert=True)
+    try:
+        if query.from_user.id != search_data['user_id']:
+            return await query.answer(script.ALRT_TXT.format(query.from_user.first_name), show_alert=True)
+    except (TypeError, KeyError):
+        pass
 
     years_per_page = 18
     years = [str(y) for y in range(date.today().year, 1899, -1)]
@@ -229,50 +225,155 @@ async def movies_cb_handler(client: Client, query: CallbackQuery):
         btn.append(pagination_buttons)
 
     btn.append([InlineKeyboardButton("⬅️ Back", callback_data=f"filter_results#{key}")])
-    await query.edit_message_text("Select Year:", reply_markup=InlineKeyboardMarkup(btn))
+    await query.edit_message_caption("Select Year:", reply_markup=InlineKeyboardMarkup(btn))
 
 @Client.on_callback_query(filters.regex(r"^year#"))
 async def year_select_cb_handler(client: Client, query: CallbackQuery):
-    _, year, key = query.data.split("#")
+    try:
+        _, year, key, page = query.data.split("#")
+        page = int(page)
+    except:
+        _, year, key = query.data.split("#")
+        page = 1
+
+    search_data = temp.ACTIVE_SEARCHES.get(key)
+    if not search_data:
+        return await query.answer("⚠️ This button has expired.", show_alert=True)
+    try:
+        if query.from_user.id != search_data['user_id']:
+            return await query.answer(script.ALRT_TXT.format(query.from_user.first_name), show_alert=True)
+    except (TypeError, KeyError):
+        pass
+
+    languages = list(LANGUAGES.keys())
+    langs_per_page = 8
+    offset = (page - 1) * langs_per_page
+
+    paginated_langs = languages[offset : offset + langs_per_page]
 
     buttons = [
         InlineKeyboardButton(f"🌐 {lang.capitalize()}", callback_data=f"lang#{lang}#movie#{year}#None#{key}")
-        for lang in LANGUAGES
+        for lang in paginated_langs
     ]
     btn = [buttons[i:i+2] for i in range(0, len(buttons), 2)]
-    btn.append([InlineKeyboardButton("⬅️ Back", callback_data=f"movies#{key}")])
-    await query.edit_message_text("Select Language:", reply_markup=InlineKeyboardMarkup(btn))
+
+    if page == 1:
+        btn.insert(0, [InlineKeyboardButton("🌐 Original Language", callback_data=f"lang#original#movie#{year}#None#{key}")])
+
+    pagination_buttons = []
+    if page > 1:
+        pagination_buttons.append(InlineKeyboardButton("⬅️ Back", callback_data=f"year#{year}#{key}#{page-1}"))
+    if len(languages) > offset + langs_per_page:
+        pagination_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"year#{year}#{key}#{page+1}"))
+
+    if pagination_buttons:
+        btn.append(pagination_buttons)
+
+    btn.append([InlineKeyboardButton("⬅️ Back to Years", callback_data=f"movies#{key}")])
+    await query.edit_message_caption("Select Language:", reply_markup=InlineKeyboardMarkup(btn))
 
 # Series Flow
 @Client.on_callback_query(filters.regex(r"^series#"))
 async def series_cb_handler(client: Client, query: CallbackQuery):
     _, key = query.data.split("#")
+
+    search_data = temp.ACTIVE_SEARCHES.get(key)
+    if not search_data:
+        return await query.answer("⚠️ This button has expired.", show_alert=True)
+    try:
+        if query.from_user.id != search_data['user_id']:
+            return await query.answer(script.ALRT_TXT.format(query.from_user.first_name), show_alert=True)
+    except (TypeError, KeyError):
+        pass
     seasons = [str(s) for s in range(1, 21)]
     btn = [InlineKeyboardButton(f"📁 Season {s}", callback_data=f"season#{s}#{key}") for s in seasons]
     btn = [btn[i:i+2] for i in range(0, len(btn), 2)]
     btn.append([InlineKeyboardButton("⬅️ Back", callback_data=f"filter_results#{key}")])
-    await query.edit_message_text("Select Season:", reply_markup=InlineKeyboardMarkup(btn))
+    await query.edit_message_caption("Select Season:", reply_markup=InlineKeyboardMarkup(btn))
 
 @Client.on_callback_query(filters.regex(r"^season#"))
 async def season_select_cb_handler(client: Client, query: CallbackQuery):
-    _, season, key = query.data.split("#")
-    episodes = [str(e) for e in range(1, 21)] # Assuming max 20 episodes
+    try:
+        _, season, key, page = query.data.split("#")
+        page = int(page)
+    except:
+        _, season, key = query.data.split("#")
+        page = 1
+
+    search_data = temp.ACTIVE_SEARCHES.get(key)
+    if not search_data:
+        return await query.answer("⚠️ This button has expired.", show_alert=True)
+    try:
+        if query.from_user.id != search_data['user_id']:
+            return await query.answer(script.ALRT_TXT.format(query.from_user.first_name), show_alert=True)
+    except (TypeError, KeyError):
+        pass
+
+    episodes_per_page = 20
+    total_episodes = 100
+    offset = (page - 1) * episodes_per_page
+
+    episodes = [str(e) for e in range(offset + 1, min(offset + episodes_per_page + 1, total_episodes + 1))]
+
     btn = [InlineKeyboardButton(f"Episode {e}", callback_data=f"episode#{season}#{e}#{key}") for e in episodes]
     btn = [btn[i:i+3] for i in range(0, len(btn), 3)]
-    btn.append([InlineKeyboardButton("⬅️ Back", callback_data=f"series#{key}")])
-    await query.edit_message_text("Select Episode:", reply_markup=InlineKeyboardMarkup(btn))
+
+    pagination_buttons = []
+    if page > 1:
+        pagination_buttons.append(InlineKeyboardButton("⬅️ Back", callback_data=f"season#{season}#{key}#{page-1}"))
+    if offset + episodes_per_page < total_episodes:
+        pagination_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"season#{season}#{key}#{page+1}"))
+
+    if pagination_buttons:
+        btn.append(pagination_buttons)
+
+    btn.append([InlineKeyboardButton("⬅️ Back to Seasons", callback_data=f"series#{key}")])
+    await query.edit_message_caption(f"Select Episode for Season {season}:", reply_markup=InlineKeyboardMarkup(btn))
 
 @Client.on_callback_query(filters.regex(r"^episode#"))
 async def episode_select_cb_handler(client: Client, query: CallbackQuery):
-    _, season, episode, key = query.data.split("#")
+    try:
+        _, season, episode, key, page = query.data.split("#")
+        page = int(page)
+    except:
+        _, season, episode, key = query.data.split("#")
+        page = 1
+
+    search_data = temp.ACTIVE_SEARCHES.get(key)
+    if not search_data:
+        return await query.answer("⚠️ This button has expired.", show_alert=True)
+    try:
+        if query.from_user.id != search_data['user_id']:
+            return await query.answer(script.ALRT_TXT.format(query.from_user.first_name), show_alert=True)
+    except (TypeError, KeyError):
+        pass
+
+    languages = list(LANGUAGES.keys())
+    langs_per_page = 8
+    offset = (page - 1) * langs_per_page
+
+    paginated_langs = languages[offset : offset + langs_per_page]
 
     buttons = [
         InlineKeyboardButton(f"🌐 {lang.capitalize()}", callback_data=f"lang#{lang}#series#{season}#{episode}#{key}")
-        for lang in LANGUAGES
+        for lang in paginated_langs
     ]
     btn = [buttons[i:i+2] for i in range(0, len(buttons), 2)]
-    btn.append([InlineKeyboardButton("⬅️ Back", callback_data=f"season#{season}#{key}")])
-    await query.edit_message_text("Select Language:", reply_markup=InlineKeyboardMarkup(btn))
+
+    if page == 1:
+        btn.insert(0, [InlineKeyboardButton("🌐 Original Language", callback_data=f"lang#original#series#{season}#{episode}#{key}")])
+
+    pagination_buttons = []
+    if page > 1:
+        pagination_buttons.append(InlineKeyboardButton("⬅️ Back", callback_data=f"episode#{season}#{episode}#{key}#{page-1}"))
+    if len(languages) > offset + langs_per_page:
+        pagination_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"episode#{season}#{episode}#{key}#{page+1}"))
+
+    if pagination_buttons:
+        btn.append(pagination_buttons)
+
+    btn.append([InlineKeyboardButton("⬅️ Back to Episodes", callback_data=f"season#{season}#{key}#1")])
+    await query.edit_message_caption("Select Language:", reply_markup=InlineKeyboardMarkup(btn))
 
 # Final handler
 @Client.on_callback_query(filters.regex(r"^lang#"))
@@ -286,9 +387,16 @@ async def lang_select_cb_handler(client: Client, query, lang=None, media_type=No
     else: # Called directly
         key = query.data.split("#")[-1]
 
-    search = temp.ACTIVE_SEARCHES.get(key)
-    if not search:
+    search_data = temp.ACTIVE_SEARCHES.get(key)
+    if not search_data:
         return await query.answer("⚠️ This button has expired.", show_alert=True)
+
+    try:
+        if query.from_user.id != search_data['user_id']:
+            return await query.answer(script.ALRT_TXT.format(query.from_user.first_name), show_alert=True)
+        search = search_data['query']
+    except (TypeError, KeyError):
+        search = search_data
 
     if media_type == "movie":
         search_query = f"{search} {media_filter} {lang}" # media_filter is year
@@ -299,7 +407,7 @@ async def lang_select_cb_handler(client: Client, query, lang=None, media_type=No
     if not files:
         return await query.answer("🚫 𝗡𝗼 𝗙𝗶𝗹𝗲 𝗪𝗲𝗿𝗲 𝗙𝗼𝘂𝗻𝗱 🚫", show_alert=1)
 
-    await auto_filter(client, search_query, query, query.message, True, spoll=(search_query, files, offset, total_results, clean_query))
+    await auto_filter(client, search_query, query, query.message, True, query.from_user.id, spoll=(search_query, files, offset, total_results, clean_query))
 
 async def spell_check_helper(client, message, reply_msg):
     query = message.text
@@ -311,9 +419,9 @@ async def spell_check_helper(client, message, reply_msg):
         for s in suggestions[:5]
     ]
     btn.append([InlineKeyboardButton("Close", callback_data=f"spol#{message.from_user.id}#close_spellcheck")])
-    await reply_msg.edit("I couldn't find anything for that. Did you mean one of these?", reply_markup=InlineKeyboardMarkup(btn))
+    await reply_msg.edit_caption("I couldn't find anything for that. Did you mean one of these?", reply_markup=InlineKeyboardMarkup(btn))
 
-async def auto_filter(client, msg, message, reply_msg, ai_search, spoll=None):
+async def auto_filter(client, msg, message, reply_msg, ai_search, user_id, spoll=None):
     if spoll:
         search, files, offset, total_results, clean_query = spoll
     else:
@@ -327,24 +435,16 @@ async def auto_filter(client, msg, message, reply_msg, ai_search, spoll=None):
             return await reply_msg.edit("🤷‍♂️ No results found 🤷‍♂️")
 
     key = os.urandom(6).hex()
-    temp.ACTIVE_SEARCHES[key] = clean_query
+    temp.ACTIVE_SEARCHES[key] = {'query': clean_query, 'user_id': user_id}
 
-    # Score and sort the files
-    scored_files = []
-    for file in files:
-        file_name = file.get("file_name", "")
-        score = calculate_match_score(file_name, clean_query)
-        scored_files.append({'file': file, 'score': score})
-
-    scored_files.sort(key=lambda x: x['score'])
-    files = [item['file'] for item in scored_files]
 
     temp.GETALL[key] = files
 
-    btn = []
+    btn = [[InlineKeyboardButton("🔎 Filter Results", callback_data=f"filter_results#{key}")]]
     for file in files:
         file_id = file.get("file_id")
         title = file.get("file_name", "Unknown Title")
+        title = re.sub(r'@\S+', '', title).strip()
         size = get_size(file.get("file_size", 0))
 
         season, episode = parse_s_e_from_name(title)
@@ -359,20 +459,25 @@ async def auto_filter(client, msg, message, reply_msg, ai_search, spoll=None):
             button_text += f" [{s_e_info}]"
         button_text += f" {title}"
 
-        btn.append([InlineKeyboardButton(text=button_text, callback_data=f"file#{file_id}")])
+        btn.append([InlineKeyboardButton(text=button_text, callback_data=f"file#{key}#{file_id}")])
 
     if total_results > len(files):
          btn.append([InlineKeyboardButton("ɴᴇxᴛ ➪", callback_data=f"next_0_{key}_{10}")])
 
-    btn.append([InlineKeyboardButton("🔎 Filter Results", callback_data=f"filter_results#{key}")])
-
-    try:
-        await reply_msg.edit_text(
-            text=f"<b>Here are the results for your query.\nThis message will self-destruct in 10 minutes for privacy.</b>",
-            reply_markup=InlineKeyboardMarkup(btn)
-        )
-    except Exception as e:
-        logger.exception(f"Error editing message in auto_filter: {e}")
+    while True:
+        try:
+            await reply_msg.edit_caption(
+                caption=f"<b>Here are the results for your query.\nThis message will self-destruct in 10 minutes for privacy.</b>",
+                reply_markup=InlineKeyboardMarkup(btn)
+            )
+            asyncio.create_task(schedule_message_deletion(reply_msg, 600))
+            break
+        except FloodWait as e:
+            logger.warning(f"FloodWait error in auto_filter. Waiting for {e.value} seconds.")
+            await asyncio.sleep(e.value)
+        except Exception as e:
+            logger.exception(f"Error editing message in auto_filter: {e}")
+            break
 
 async def manual_filters(client, message, text=False):
     group_id = message.chat.id
@@ -445,8 +550,13 @@ async def advantage_spoll_choker(bot, query):
             if files:
                 k = (movie, files, offset, total_results, clean_query)
                 ai_search = True
-                reply_msg = await query.message.edit_text(f"<b><i>Searching For {movie} 🔍</i></b>")
-                await auto_filter(bot, movie, query, reply_msg, ai_search, k)
+                await query.message.delete()
+                reply_msg = await bot.send_photo(
+                    chat_id=query.message.chat.id,
+                    photo=LOADING_GIF,
+                    caption=f"<b><i>Searching For {movie} 🔍</i></b>"
+                )
+                await auto_filter(bot, movie, query, reply_msg, ai_search, query.from_user.id, k)
             else:
                 reqstr1 = query.from_user.id if query.from_user else 0
                 reqstr = await bot.get_users(reqstr1)
@@ -620,7 +730,22 @@ async def cb_handler(client: Client, query: CallbackQuery):
             alert = alert.replace("\\n", "\n").replace("\\t", "\t")
             await query.answer(alert, show_alert=True)
     if query.data.startswith("file"):
-        ident, file_id = query.data.split("#")
+        data_parts = query.data.split("#")
+        if len(data_parts) == 3: # new format: file#key#file_id
+            ident, key, file_id = data_parts
+            search_data = temp.ACTIVE_SEARCHES.get(key)
+            if not search_data:
+                return await query.answer("⚠️ This button has expired.", show_alert=True)
+            try:
+                if query.from_user.id != search_data['user_id']:
+                    return await query.answer(script.ALRT_TXT.format(query.from_user.first_name), show_alert=True)
+            except (TypeError, KeyError):
+                pass
+        elif len(data_parts) == 2: # old format: file#file_id
+            ident, file_id = data_parts
+        else:
+            return
+
         files_ = await get_file_details(file_id)
         if not files_:
             return await query.answer('Nᴏ sᴜᴄʜ ғɪʟᴇ ᴇxɪsᴛ.')
@@ -649,6 +774,7 @@ async def cb_handler(client: Client, query: CallbackQuery):
             await query.answer(url=f"https://telegram.me/{temp.U_NAME}?start={ident}_{file_id}")
         except Exception as e:
             await query.answer(url=f"https://telegram.me/{temp.U_NAME}?start={ident}_{file_id}")
+        return
     elif query.data.startswith("sendfiles"):
         ident, key = query.data.split("#")
         settings = await get_settings(query.message.chat.id)
@@ -665,6 +791,7 @@ async def cb_handler(client: Client, query: CallbackQuery):
         except Exception as e:
             logger.exception(e)
             await query.answer(url=f"https://telegram.me/{temp.U_NAME}?start=sendfiles4_{key}")
+        return
     elif query.data.startswith("unmuteme"):
         ident, userid = query.data.split("#")
         user_id = query.from_user.id
@@ -687,11 +814,13 @@ async def cb_handler(client: Client, query: CallbackQuery):
         if not files_:
             return await query.answer('Nᴏ sᴜᴄʜ ғɪʟᴇ ᴇxɪsᴛ.')
         await query.answer(url=f"https://telegram.me/{temp.U_NAME}?start=file_{file_id}")
+        return
     elif query.data.startswith("checksub"):
         if AUTH_CHANNEL and not await is_subscribed(client, query):
             return await query.answer("Jᴏɪɴ ᴏᴜʀ Bᴀᴄᴋ-ᴜᴘ ᴄʜᴀɴɴᴇʟ ᴍᴀʜɴ! 😒", show_alert=True)
         ident, kk, file_id = query.data.split("#")
         await query.answer(url=f"https://t.me/{temp.U_NAME}?start={kk}_{file_id}")
+        return
     elif query.data == "pages":
         await query.answer()
     elif query.data.startswith("send_fsall"):
@@ -813,7 +942,7 @@ async def cb_handler(client: Client, query: CallbackQuery):
     elif query.data.startswith("already_available"):
         ident, from_user = query.data.split("#")
         btn = [[InlineKeyboardButton("🟢 Aʟʀᴇᴀᴅʏ Aᴠᴀɪʟᴀʙʟᴇ 🟢", callback_data=f"alalert#{from_user}")]]
-        btn2 = [[InlineKeyboardButton('Jᴏɪɴ Cʜᴀɴɴᴇʟ', url=link.invite_link), InlineKeyboardButton("Vɪᴇᴡ Sᴛᴀᴛᴜs", url=f"{query.message.link}")], [InlineKeyboardButton("Rᴇᴏ̨ᴜᴇsᴛ Gʀᴏᴜᴘ Lɪɴᴋ", url="https.me/vj_bots")]]
+        btn2 = [[InlineKeyboardButton('Jᴏɪɴ Cʜᴀɴɴᴇʟ', url=link.invite_link), InlineKeyboardButton("Vɪᴇᴡ Sᴛᴀᴛᴜs", url=f"{query.message.link}")], [InlineKeyboardButton("Rᴇᴏ̨ᴜᴇsᴛ Gʀᴏᴜᴘ Lɪɴᴋ", url="https://t.me/vj_bots")]]
         if query.from_user.id in ADMINS:
             user = await client.get_users(from_user)
             reply_markup = InlineKeyboardMarkup(btn)
@@ -1096,4 +1225,142 @@ async def cb_handler(client: Client, query: CallbackQuery):
             buttons = [[InlineKeyboardButton('Rᴇsᴜʟᴛ Pᴀɢᴇ', callback_data=f'setgs#button#{settings["button"]}#{str(grp_id)}'), InlineKeyboardButton('Bᴜᴛᴛᴏɴ' if settings["button"] else 'Tᴇxᴛ', callback_data=f'setgs#button#{settings["button"]}#{str(grp_id)}')], [InlineKeyboardButton('Pʀᴏᴛᴇᴄᴛ Cᴏɴᴛᴇɴᴛ', callback_data=f'setgs#file_secure#{settings["file_secure"]}#{str(grp_id)}'), InlineKeyboardButton('✔ Oɴ' if settings["file_secure"] else '✘ Oғғ', callback_data=f'setgs#file_secure#{settings["file_secure"]}#{str(grp_id)}')], [InlineKeyboardButton('Iᴍᴅʙ', callback_data=f'setgs#imdb#{settings["imdb"]}#{str(grp_id)}'), InlineKeyboardButton('✔ Oɴ' if settings["imdb"] else '✘ Oғғ', callback_data=f'setgs#imdb#{settings["imdb"]}#{str(grp_id)}')], [InlineKeyboardButton('Sᴘᴇʟʟ Cʜᴇᴄᴋ', callback_data=f'setgs#spell_check#{settings["spell_check"]}#{str(grp_id)}'), InlineKeyboardButton('✔ Oɴ' if settings["spell_check"] else '✘ Oғғ', callback_data=f'setgs#spell_check#{settings["spell_check"]}#{str(grp_id)}')], [InlineKeyboardButton('Wᴇʟᴄᴏᴍᴇ Msɢ', callback_data=f'setgs#welcome#{settings["welcome"]}#{str(grp_id)}'), InlineKeyboardButton('✔ Oɴ' if settings["welcome"] else '✘ Oғғ', callback_data=f'setgs#welcome#{settings["welcome"]}#{str(grp_id)}')], [InlineKeyboardButton('Aᴜᴛᴏ-Dᴇʟᴇᴛᴇ', callback_data=f'setgs#auto_delete#{settings["auto_delete"]}#{str(grp_id)}'), InlineKeyboardButton('5 Mɪɴs' if settings["auto_delete"] else '✘ Oғғ', callback_data=f'setgs#auto_delete#{settings["auto_delete"]}#{str(grp_id)}')], [InlineKeyboardButton('Aᴜᴛᴏ-Fɪʟᴛᴇʀ', callback_data=f'setgs#auto_ffilter#{settings["auto_ffilter"]}#{str(grp_id)}'), InlineKeyboardButton('✔ Oɴ' if settings["auto_ffilter"] else '✘ Oғғ', callback_data=f'setgs#auto_ffilter#{settings["auto_ffilter"]}#{str(grp_id)}')], [InlineKeyboardButton('Mᴀx Bᴜᴛᴛᴏɴs', callback_data=f'setgs#max_btn#{settings["max_btn"]}#{str(grp_id)}'), InlineKeyboardButton('10' if settings["max_btn"] else f'{MAX_B_TN}', callback_data=f'setgs#max_btn#{settings["max_btn"]}#{str(grp_id)}')], [InlineKeyboardButton('SʜᴏʀᴛLɪɴᴋ', callback_data=f'setgs#is_shortlink#{settings["is_shortlink"]}#{str(grp_id)}'), InlineKeyboardButton('✔ Oɴ' if settings["is_shortlink"] else '✘ Oғғ', callback_data=f'setgs#is_shortlink#{settings["is_shortlink"]}#{str(grp_id)}')]]
             reply_markup = InlineKeyboardMarkup(buttons)
             await query.message.edit_reply_markup(reply_markup)
+    elif query.data.startswith("get_info"):
+        return await get_info_handler(client, query)
     await query.answer(MSG_ALRT)
+
+async def get_info_handler(client, query):
+    try:
+        _, file_id = query.data.split("#")
+    except ValueError:
+        return await query.answer("Invalid callback data.", show_alert=True)
+
+    file_details = await get_file_details(file_id)
+    if not file_details:
+        return await query.answer("File details not found in database.", show_alert=True)
+
+    msg = await query.message.reply_text("`Analyzing...`", quote=True)
+
+    try:
+        # In-memory partial download
+        limit = 20 * 1024 * 1024  # 20MB
+        in_memory_buffer = bytearray()
+
+        async for chunk in client.stream_media(file_id):
+            if chunk:
+                in_memory_buffer.extend(chunk)
+                if len(in_memory_buffer) >= limit:
+                    break
+
+        if not in_memory_buffer:
+            return await msg.edit("Could not download file. It might be empty or inaccessible.")
+
+        # Execute ffprobe, piping the buffer to stdin
+        process = await asyncio.create_subprocess_exec(
+            "ffprobe",
+            "-v", "quiet",
+            "-print_format", "json",
+            "-show_format",
+            "-show_streams",
+            "-",  # Read from stdin
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate(input=in_memory_buffer)
+
+        if process.returncode != 0:
+            logger.error(f"FFprobe error for {file_id}: {stderr.decode().strip()}")
+            return await msg.edit("Error analyzing file. It might not be a valid media format or is corrupted.")
+
+        info_json = json.loads(stdout)
+
+        formatted_info = format_media_info(info_json, file_details)
+        await msg.edit(formatted_info, parse_mode=enums.ParseMode.MARKDOWN, disable_web_page_preview=True)
+
+    except Exception as e:
+        logger.exception("Error in get_info_handler")
+        await msg.edit(f"An unexpected error occurred: `{str(e)}`")
+
+def format_media_info(data, file_details):
+    LANG_MAP = {
+        "eng": "English", "hin": "Hindi", "tam": "Tamil", "tel": "Telugu",
+        "mal": "Malayalam", "kan": "Kannada", "ben": "Bengali", "spa": "Spanish",
+        "fra": "French", "jpn": "Japanese", "kor": "Korean", "rus": "Russian",
+        "chi": "Chinese", "ara": "Arabic", "ger": "German", "dut": "Dutch",
+        "ita": "Italian", "por": "Portuguese", "und": "Unknown",
+    }
+    try:
+        format_info = data.get('format', {})
+        file_name = file_details.get('file_name', 'N/A')
+
+        text = f"🎬 **Media Information**\n\n"
+        text += f"**File:** `{file_name}`\n\n"
+
+        # --- General Info ---
+        duration_sec = float(format_info.get('duration', 0))
+        duration = str(timedelta(seconds=int(duration_sec))) if duration_sec > 0 else "N/A"
+
+        # Use file size from database for accuracy
+        file_size_bytes = file_details.get('file_size', 0)
+        file_size = get_size(file_size_bytes)
+
+        # Calculate bitrate manually for accuracy with partial analysis
+        if duration_sec > 0 and file_size_bytes > 0:
+            bitrate = f"{(file_size_bytes * 8) // int(duration_sec) // 1000} kbps"
+        else:
+            bitrate = "N/A"
+
+        text += f"**General**\n"
+        text += f"- **Format:** `{format_info.get('format_long_name', 'N/A')}`\n"
+        text += f"- **Size:** `{file_size}`\n"
+        text += f"- **Duration:** `{duration}`\n"
+        text += f"- **Bitrate:** `{bitrate}`\n\n"
+
+        # --- Video Stream ---
+        video_stream = next((s for s in data.get('streams', []) if s.get('codec_type') == 'video'), None)
+        if video_stream:
+            fr_str = video_stream.get('r_frame_rate', '0/1')
+            try:
+                num, den = map(int, fr_str.split('/'))
+                frame_rate = f"{num / den:.2f} fps" if den != 0 else "N/A"
+            except (ValueError, ZeroDivisionError):
+                frame_rate = "N/A"
+
+            text += f"🖼️ **Video**\n"
+            text += f"- **Codec:** `{video_stream.get('codec_name', 'N/A').upper()}`\n"
+            text += f"- **Resolution:** `{video_stream.get('width')}x{video_stream.get('height')}`\n"
+            text += f"- **Framerate:** `{frame_rate}`\n\n"
+
+        # --- Audio Streams ---
+        audio_streams = [s for s in data.get('streams', []) if s.get('codec_type') == 'audio']
+        if audio_streams:
+            text += "🔊 **Audio**\n"
+            for i, stream in enumerate(audio_streams):
+                lang_code = stream.get('tags', {}).get('language', 'und')
+                lang_full = LANG_MAP.get(lang_code, lang_code.capitalize())
+                codec = stream.get('codec_name', 'N/A').upper()
+                channels = stream.get('channel_layout', 'N/A')
+                bitrate_audio = f"{int(stream.get('bit_rate', 0)) // 1000} kbps" if stream.get('bit_rate') else ''
+
+                audio_parts = [lang_full, codec, channels, bitrate_audio]
+                audio_line = " | ".join(filter(None, audio_parts))
+                text += f"- **Track {i+1}:** `{audio_line}`\n"
+            text += "\n"
+
+        # --- Subtitle Streams ---
+        subtitle_streams = [s for s in data.get('streams', []) if s.get('codec_type') == 'subtitle']
+        if subtitle_streams:
+            text += "📝 **Subtitles**\n"
+            for i, stream in enumerate(subtitle_streams):
+                lang_code = stream.get('tags', {}).get('language', 'und')
+                lang_full = LANG_MAP.get(lang_code, lang_code.capitalize())
+                codec = stream.get('codec_name', 'N/A').upper()
+
+                sub_line = f"{lang_full} | {codec}"
+                text += f"- **Track {i+1}:** `{sub_line}`\n"
+
+        return text.strip()
+    except Exception as e:
+        logger.exception("Error formatting media info")
+        return f"An error occurred while formatting media info: {e}"
