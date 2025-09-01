@@ -30,6 +30,8 @@ from plugins.channel import save_batch
 from TechVJ.bot import TechVJBot
 from TechVJ.util.keepalive import ping_server
 from TechVJ.bot.clients import initialize_clients
+from database.ia_filterdb import create_text_index
+from plugins.file_update import AnnouncementManager
 
 ppath = "plugins/*.py"
 files = glob.glob(ppath)
@@ -40,13 +42,15 @@ async def periodic_save():
     """Periodically save the file batch to the database every 60 seconds."""
     while True:
         await asyncio.sleep(60)
-        await save_batch()
+        await save_batch(TechVJBot)
 
 async def start():
     print('\n')
     print('Initalizing Your Bot')
     await TechVJBot.start()
     bot_info = await TechVJBot.get_me()
+    # Create text index for file search
+    create_text_index()
     await initialize_clients()
     for name in files:
         with open(name) as a:
@@ -65,6 +69,8 @@ async def start():
 
     # Start the periodic saving task for channel files
     asyncio.create_task(periodic_save())
+
+    TechVJBot.announcement_manager = AnnouncementManager(TechVJBot)
 
     b_users, b_chats = await db.get_banned()
     temp.BANNED_USERS = b_users
@@ -87,8 +93,8 @@ async def start():
         try:
             k = await TechVJBot.send_message(chat_id=ch, text="**Bot Restarted**")
             await k.delete()
-        except:
-            print("Make Your Bot Admin In File Channels With Full Rights")
+        except Exception as e:
+            print(f"Error sending message to channel {ch}: {e}\nMake sure your bot is an admin in this channel with full rights.")
     try:
         k = await TechVJBot.send_message(chat_id=AUTH_CHANNEL, text="**Bot Restarted**")
         await k.delete()
